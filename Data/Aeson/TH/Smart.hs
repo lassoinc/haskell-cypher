@@ -1,11 +1,5 @@
-{-# LANGUAGE CPP, NoImplicitPrelude, TemplateHaskell, OverloadedStrings #-}
+{-# LANGUAGE CPP, NoImplicitPrelude, TemplateHaskell, OverloadedStrings, ScopedTypeVariables #-}
 -- Shamelessly copied from Bryan O'Sullivan, 2011
-
--- null parameters should be excluded
--- enumerations are just strings
--- constructors are not objectified
--- parsing of maybe parameters should use a Nothing if they're not found
-
 
 module Data.Aeson.TH.Smart
     ( deriveJSON
@@ -30,7 +24,8 @@ import Data.Aeson.Types ( Value(..), Parser )
 -- from base:
 import Control.Applicative ( pure, (<$>), (<*>) )
 import Control.Monad       ( return, mapM, liftM2, fail )
-import Data.Bool           ( otherwise )
+import Data.Bool           ( otherwise)
+import Data.Default        ( def, Default )
 import Data.Eq             ( (==) )
 import Data.Function       ( ($), (.), id )
 import Data.Functor        ( fmap )
@@ -38,7 +33,7 @@ import Data.List           ( (++), foldl, foldl', intercalate
                            , length, map, zip, genericLength
                            )
 import Data.Maybe          ( Maybe(Nothing, Just) )
-import Prelude             ( String, (-), Integer, fromIntegral, not, error, filter, fst, snd)
+import Prelude             ( String, (-), Integer, fromIntegral, not, error, filter, fst, snd, Bool, undefined)
 import Text.Printf         ( printf )
 import Text.Show           ( show )
 #if __GLASGOW_HASKELL__ < 700
@@ -54,7 +49,6 @@ import qualified Data.Text as T ( Text, pack, unpack )
 -- from vector:
 import qualified Data.Vector as V ( unsafeIndex, null, length, create, filter)
 import qualified Data.Vector.Mutable as VM ( unsafeNew, unsafeWrite )
-
 
 --------------------------------------------------------------------------------
 -- Convenience
@@ -429,34 +423,23 @@ parseArgs tName _ (NormalC conName ts) = parseProduct tName conName $ genericLen
 -- Records.
 parseArgs tName withField (RecC conName ts) =
     [ do obj <- newName "recObj"
-         let x:xs = [ [|lookupField|]
-                      `appE` (litE $ stringL $ show tName)
-                      `appE` (litE $ stringL $ nameBase conName)
-                      `appE` (varE obj)
-                      `appE` ( [e|T.pack|]
-                               `appE`
-                               fieldNameExp withField field
-                             )
-                    | (field, _, _) <- ts
+         let x:xs = [ do
+                        b <- isInstance ''Default [ty]
+                        [|lookupField|]
+                          `appE` (if b then [| Just def |] else [| Nothing|])
+                          `appE` (litE $ stringL $ show tName)
+                          `appE` (litE $ stringL $ nameBase conName)
+                          `appE` (varE obj)
+                          `appE` ( [e|T.pack|]
+                                   `appE`
+                                   fieldNameExp withField field
+                                 )
+                    | (field, _, ty) <- ts
                     ]
          match (conP 'Object [varP obj])
-               ( normalB $ condE ( infixApp ([|H.size|] `appE` varE obj)
-                                            [|(==)|]
-                                            (litE $ integerL $ genericLength ts)
-                                 )
-                                 ( foldl' (\a b -> infixApp a [|(<*>)|] b)
+               ( normalB $ ( foldl' (\a b -> infixApp a [|(<*>)|] b)
                                           (infixApp (conE conName) [|(<$>)|] x)
                                           xs
-                                 )
-                                 ( parseTypeMismatch tName conName
-                                     ( litE $ stringL $ "Object with "
-                                                        ++ show (length ts)
-                                                        ++ " name/value pairs"
-                                     )
-                                     ( infixApp ([|show . H.size|] `appE` varE obj)
-                                                [|(++)|]
-                                                (litE $ stringL $ " name/value pairs")
-                                     )
                                  )
                )
                []
@@ -531,10 +514,12 @@ parseTypeMismatch tName conName expected actual =
           , actual
           ]
 
-lookupField :: (FromJSON a) => String -> String -> Object -> T.Text -> Parser a
-lookupField tName rec obj key =
+lookupField :: (FromJSON a) => Maybe a -> String -> String -> Object -> T.Text -> Parser a
+lookupField d tName rec obj key =
     case H.lookup key obj of
-      Nothing -> unknownFieldFail tName rec (T.unpack key)
+      Nothing -> case d of
+        Nothing -> unknownFieldFail tName rec (T.unpack key)
+        Just x -> return x
       Just v  -> parseJSON v
 
 unknownFieldFail :: String -> String -> String -> Parser fail

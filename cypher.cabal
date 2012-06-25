@@ -45,10 +45,23 @@ Cabal-version:       >=1.2
 
 Library
   -- Modules exported by the library.
-  Exposed-modules:     Database.Cypher, Database.Cypher.Lucene, Data.Aeson.TH.Smart
+  Exposed-modules:     Database.Cypher, Database.Cypher.Lucene, Data.Aeson.TH.Smart, Data.Default.TH
   
   -- Packages needed in order to build this package.
-  Build-depends:       base, aeson, http-conduit, transformers, conduit, text, bytestring, http-types, vector, unordered-containers, attoparsec, OneTuple
+  Build-depends:         base
+                       , aeson
+                       , http-conduit
+                       , transformers
+                       , conduit
+                       , text
+                       , bytestring
+                       , http-types <1
+                       , vector <1
+                       , unordered-containers <1
+                       , attoparsec <1
+                       , OneTuple <1
+                       , data-default <1
+                       , template-haskell >= 2.7
   
   -- Modules not exported by this package.
   -- Other-modules:       

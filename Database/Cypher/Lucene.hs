@@ -58,11 +58,6 @@ fromNumber (D d)
     | isNaN d || isInfinite d = "null"
     | otherwise               = realFloat d
 
-(<>) :: Builder -> Builder -> Builder
-(<>) = mappend
-{-# INLINE (<>) #-}
-infixr 6 <>
-
 -- | Efficiently serialize a JSON value as a lazy 'L.ByteString'.
 luceneEncode :: ToJSON a => a -> L.ByteString
 luceneEncode = encodeUtf8 . toLazyText . fromValue . toJSON
