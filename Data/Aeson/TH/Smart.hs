@@ -1,147 +1,13 @@
-{-# LANGUAGE CPP, NoImplicitPrelude, TemplateHaskell #-}
+{-# LANGUAGE CPP, NoImplicitPrelude, TemplateHaskell, OverloadedStrings #-}
 -- Shamelessly copied from Bryan O'Sullivan, 2011
 
 -- null parameters should be excluded
 -- enumerations are just strings
+-- constructors are not objectified
+-- parsing of maybe parameters should use a Nothing if they're not found
 
-{-|
-Module:      Data.Aeson.TH
-Copyright:   (c) 2011 Bryan O'Sullivan
-             (c) 2011 MailRank, Inc.
-License:     Apache
-Stability:   experimental
-Portability: portable
 
-Functions to mechanically derive 'ToJSON' and 'FromJSON' instances. Note that
-you need to enable the @TemplateHaskell@ language extension in order to use this
-module.
-
-An example shows how instances are generated for arbitrary data types. First we
-define a data type:
-
-@
-data D a = Nullary
-         | Unary Int
-         | Product String Char a
-         | Record { testOne   :: Double
-                  , testTwo   :: Bool
-                  , testThree :: D a
-                  } deriving Eq
-@
-
-Next we derive the necessary instances. Note that we make use of the feature to
-change record field names. In this case we drop the first 4 characters of every
-field name.
-
-@
-$('deriveJSON' ('drop' 4) ''D)
-@
-
-This will result in the following (simplified) code to be spliced in your program:
-
-@
-import Control.Applicative
-import Control.Monad
-import Data.Aeson
-import Data.Aeson.TH
-import qualified Data.HashMap.Strict as H
-import qualified Data.Text as T
-import qualified Data.Vector as V
-
-instance 'ToJSON' a => 'ToJSON' (D a) where
-    'toJSON' =
-      \value ->
-        case value of
-          Nullary ->
-              'object' [T.pack \"Nullary\" .= 'toJSON' ([] :: [()])]
-          Unary arg1 ->
-              'object' [T.pack \"Unary\" .= 'toJSON' arg1]
-          Product arg1 arg2 arg3 ->
-              'object' [ T.pack \"Product\"
-                       .= ('Array' $ 'V.create' $ do
-                             mv <- 'VM.unsafeNew' 3
-                             'VM.unsafeWrite' mv 0 ('toJSON' arg1)
-                             'VM.unsafeWrite' mv 1 ('toJSON' arg2)
-                             'VM.unsafeWrite' mv 2 ('toJSON' arg3)
-                             return mv)
-                     ]
-          Record arg1 arg2 arg3 ->
-              'object' [ T.pack \"Record\"
-                       .= 'object' [ T.pack \"One\"   '.=' arg1
-                                 , T.pack \"Two\"   '.=' arg2
-                                 , T.pack \"Three\" '.=' arg3
-                                 ]
-                     ]
-@
-
-@
-instance 'FromJSON' a => 'FromJSON' (D a) where
-    'parseJSON' =
-      \value ->
-        case value of
-          'Object' obj ->
-            case H.toList obj of
-              [(conKey, conVal)] ->
-                case conKey of
-                  _ | conKey == T.pack \"Nullary\" ->
-                        case conVal of
-                          'Array' arr ->
-                            if V.null arr
-                            then pure Nullary
-                            else fail \"\<error message\>\"
-                          _ -> fail \"\<error message\>\"
-                    | conKey == T.pack \"Unary\" ->
-                        case conVal of
-                          arg -> Unary \<$\> parseJSON arg
-                    | conKey == T.pack \"Product\" ->
-                        case conVal of
-                          'Array' arr ->
-                            if V.length arr == 3
-                            then Product \<$\> 'parseJSON' (arr `V.unsafeIndex` 0)
-                                         \<*\> 'parseJSON' (arr `V.unsafeIndex` 1)
-                                         \<*\> 'parseJSON' (arr `V.unsafeIndex` 2)
-                            else fail \"\<error message\>\"
-                          _ -> fail \"\<error message\>\"
-                    | conKey == T.pack \"Record\" ->
-                        case conVal of
-                          'Object' recObj ->
-                            if H.size recObj == 3
-                            then Record \<$\> recObj '.:' T.pack \"One\"
-                                        \<*\> recObj '.:' T.pack \"Two\"
-                                        \<*\> recObj '.:' T.pack \"Three\"
-                            else fail \"\<error message\>\"
-                          _ -> fail \"\<error message\>\"
-                    | otherwise -> fail \"\<error message\>\"
-              _ -> fail \"\<error message\>\"
-          _ -> fail \"\<error message\>\"
-@
-
-Note that every \"\<error message\>\" is in fact a descriptive message which
-provides as much information as is reasonable about the failed parse.
-
-Now we can use the newly created instances.
-
-@
-d :: D 'Int'
-d = Record { testOne = 3.14159
-           , testTwo = 'True'
-           , testThree = Product \"test\" \'A\' 123
-           }
-@
-
->>> fromJSON (toJSON d) == Success d
-> True
-
-Please note that you can derive instances for tuples using the following syntax:
-
-@
--- FromJSON and ToJSON instances for 4-tuples.
-$('deriveJSON' id ''(,,,))
-@
-
--}
-
-module Data.Aeson.TH
+module Data.Aeson.TH.Smart
     ( deriveJSON
 
     , deriveToJSON
@@ -172,7 +38,7 @@ import Data.List           ( (++), foldl, foldl', intercalate
                            , length, map, zip, genericLength
                            )
 import Data.Maybe          ( Maybe(Nothing, Just) )
-import Prelude             ( String, (-), Integer, fromIntegral, error )
+import Prelude             ( String, (-), Integer, fromIntegral, not, error, filter, fst, snd)
 import Text.Printf         ( printf )
 import Text.Show           ( show )
 #if __GLASGOW_HASKELL__ < 700
@@ -186,7 +52,7 @@ import Language.Haskell.TH
 -- from text:
 import qualified Data.Text as T ( Text, pack, unpack )
 -- from vector:
-import qualified Data.Vector as V ( unsafeIndex, null, length, create )
+import qualified Data.Vector as V ( unsafeIndex, null, length, create, filter)
 import qualified Data.Vector.Mutable as VM ( unsafeNew, unsafeWrite )
 
 
@@ -308,89 +174,68 @@ consToJSON withField [con] = do
     value <- newName "value"
     lam1E (varP value)
           $ caseE (varE value)
-                  [encodeArgs id withField con]
--- With multiple constructors we need to remember which constructor is
--- encoded. This is done by generating a JSON object which maps to constructor's
--- name to the JSON encoding of its contents.
--- CHECK HERE FOR ENUMERATIONS AND HANDLE THEM SEPARATELY
-consToJSON withField cons
-	| enumeration cons = do
-		-- do this!!
-	| otherwise = do
+                  [encodeArgs Nothing withField con]
+
+consToJSON withField cons = do
 	    value <- newName "value"
 	    lam1E (varP value)
 	          $ caseE (varE value)
-	                  [ encodeArgs (wrap $ getConName con) withField con
+	                  [ encodeArgs (Just $ wrap $ [|String . T.pack|] `appE` conNameExp con) withField con
 	                  | con <- cons
 	                  ]
   where
-    wrap :: Name -> Q Exp -> Q Exp
-    wrap name exp =
-        let fieldName = [e|T.pack|] `appE` litE (stringL $ nameBase name)
-        in [e|object|] `appE` listE [ infixApp fieldName
-                                               [e|(.=)|]
-                                               exp
-                                    ]
+    wrap :: Q Exp -> [Q Exp] -> Q Exp
+    wrap name exps =
+        [e|object|] `appE` ([e| filter (not .(==Null) . snd )|] `appE`
+            listE (infixApp (litE $ stringL "constructor") [e|(.=)|] name : exps))
 
 -- | Generates code to generate the JSON encoding of a single constructor.
-encodeArgs :: (Q Exp -> Q Exp) -> (String -> String) -> Con -> Q Match
--- Nullary constructors. Generates code that explicitly matches against the
--- constructor even though it doesn't contain data. This is useful to prevent
--- type errors.
-encodeArgs withExp _ (NormalC conName []) =
-    match (conP conName [])
-          (normalB $ withExp [e|toJSON ([] :: [()])|])
-          []
--- Polyadic constructors with special case for unary constructors.
-encodeArgs withExp _ (NormalC conName ts) = do
+encodeArgs :: Maybe ([Q Exp] -> Q Exp) -> (String -> String) -> Con -> Q Match
+encodeArgs _ _ c@(NormalC conName []) =
+    match (conP conName []) (normalB $ [e|toJSON|] `appE` ([|T.pack|] `appE` conNameExp c)) []
+encodeArgs wrapper _ (NormalC conName ts) = do
     let len = length ts
     args <- mapM newName ["arg" ++ show n | n <- [1..len]]
-    js <- case [[e|toJSON|] `appE` varE arg | arg <- args] of
-            -- Single argument is directly converted.
-            [e] -> return e
-            -- Multiple arguments are converted to a JSON array.
-            es  -> do
-              mv <- newName "mv"
-              let newMV = bindS (varP mv)
-                                ([e|VM.unsafeNew|] `appE`
-                                  litE (integerL $ fromIntegral len))
-                  stmts = [ noBindS $
-                              [e|VM.unsafeWrite|] `appE`
-                                (varE mv) `appE`
-                                  litE (integerL ix) `appE`
-                                    e
-                          | (ix, e) <- zip [(0::Integer)..] es
-                          ]
-                  ret = noBindS $ [e|return|] `appE` varE mv
-              return $ [e|Array|] `appE`
-                         (varE 'V.create `appE`
-                           doE (newMV:stmts++[ret]))
-    match (conP conName $ map varP args)
-          (normalB $ withExp js)
-          []
+    let js = case [[e|toJSON|] `appE` varE arg | arg <- args] of
+              -- Single argument is directly converted.
+              [e] -> e
+              -- Multiple arguments are converted to a JSON array.
+              es  -> do
+                 mv <- newName "mv"
+                 let newMV = bindS (varP mv)
+                                  ([e|VM.unsafeNew|] `appE`
+                                    litE (integerL $ fromIntegral len))
+                     stmts = [noBindS $
+                                [e|VM.unsafeWrite|] `appE`
+                                  (varE mv) `appE`
+                                    litE (integerL ix) `appE` e | (ix, e) <- zip [(0::Integer)..] es]
+                     ret = noBindS $ [e|return|] `appE` varE mv
+                     fltr = [e| V.filter (not . (== Null))|]
+                 [e|Array|] `appE` (fltr `appE` (varE 'V.create `appE` doE (newMV:stmts++[ret])))
+    let b = case wrapper of
+              Nothing -> js
+              (Just wrapper') -> wrapper' [infixApp (litE (stringL "value")) [e|(.=)|] js]
+    match (conP conName $ map varP args) (normalB b) []
 -- Records.
 encodeArgs withExp withField (RecC conName ts) = do
     args <- mapM newName ["arg" ++ show n | (_, n) <- zip ts [1 :: Integer ..]]
-    let js = [ infixApp ([e|T.pack|] `appE` fieldNameExp withField field)
-                        [e|(.=)|]
-                        (varE arg)
-             | (arg, (field, _, _)) <- zip args ts
+    let args' = map (([e|toJSON|] `appE`) . varE) args
+    let js = [ infixApp ([e|T.pack|] `appE` fieldNameExp withField field) [e|(.=)|] arg
+             | (arg, (field, _, _)) <- zip args' ts
              ]
-    match (conP conName $ map varP args)
-          (normalB $ withExp $ [e|object|] `appE` listE js)
-          []
+    let b = case withExp of
+              Nothing -> [e|object|] `appE` ([e| filter (not . (==Null) . snd) |] `appE` listE js)
+              (Just wrapper) -> wrapper js
+    match (conP conName $ map varP args) (normalB b) []
 -- Infix constructors.
 encodeArgs withExp _ (InfixC _ conName _) = do
     al <- newName "argL"
     ar <- newName "argR"
-    match (infixP (varP al) conName (varP ar))
-          ( normalB
-          $ withExp
-          $ [e|toJSON|] `appE` listE [ [e|toJSON|] `appE` varE a
-                                     | a <- [al,ar]
-                                     ]
-          )
-          []
+    let l = listE [[e|toJSON|] `appE` varE a | a <- [al,ar]]
+    let b = case withExp of
+              Nothing -> [e|toJSON|] `appE` l
+              (Just wrapper) -> wrapper [infixApp (litE $ stringL "value") [e|(.=)|] l]
+    match (infixP (varP al) conName (varP ar)) (normalB b) []
 -- Existentially quantified constructors.
 encodeArgs withExp withField (ForallC _ _ con) =
     encodeArgs withExp withField con
