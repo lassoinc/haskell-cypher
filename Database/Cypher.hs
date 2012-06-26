@@ -54,8 +54,6 @@ data Entity a = Entity {
 	entity_data :: a
 } deriving (Show, Eq)
 
--- Ok, so they aren't inverses. But this is more useful.
-
 instance FromJSON a => FromJSON (Entity a) where
 	parseJSON (Object v) = Entity <$>
 							v .: "self" <*>

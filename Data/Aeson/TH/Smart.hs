@@ -1,6 +1,11 @@
 {-# LANGUAGE CPP, NoImplicitPrelude, TemplateHaskell, OverloadedStrings, ScopedTypeVariables #-}
 -- Shamelessly copied from Bryan O'Sullivan, 2011
 
+-- HANDLE ERRORS BETTER
+-- REFACTOR
+-- RELEASE ON HACKAGE
+-- TRY TO MERGE WITH ORIGINAL
+
 module Data.Aeson.TH.Smart
     ( deriveJSON
 
@@ -16,7 +21,7 @@ module Data.Aeson.TH.Smart
 --------------------------------------------------------------------------------
 
 -- from aeson:
-import Data.Aeson ( toJSON, Object, object, (.=)
+import Data.Aeson ( toJSON, Object, object, (.=), (.:)
                   , ToJSON, toJSON
                   , FromJSON, parseJSON
                   )
@@ -33,7 +38,7 @@ import Data.List           ( (++), foldl, foldl', intercalate
                            , length, map, zip, genericLength
                            )
 import Data.Maybe          ( Maybe(Nothing, Just) )
-import Prelude             ( String, (-), Integer, fromIntegral, not, error, filter, fst, snd, Bool, undefined)
+import Prelude             ( String, (-), Integer, fromIntegral, not, error, filter, fst, snd, Bool(..), flip, concat)
 import Text.Printf         ( printf )
 import Text.Show           ( show )
 #if __GLASGOW_HASKELL__ < 700
@@ -44,6 +49,7 @@ import Prelude             ( fromInteger )
 import qualified Data.HashMap.Strict as H ( lookup, toList, size )
 -- from template-haskell:
 import Language.Haskell.TH
+import Language.Haskell.TH.Syntax
 -- from text:
 import qualified Data.Text as T ( Text, pack, unpack )
 -- from vector:
@@ -310,6 +316,10 @@ mkParseJSON :: (String -> String) -- ^ Function to change field names.
 mkParseJSON withField name =
     withType name (\_ cons -> consFromJSON name withField cons)
 
+-- if it's 1ary flat constrcutor, it's just the constructor name, no matter how many
+-- if there's many nary constructors, we make an object with value and constructor records
+-- if there's many record constructors, we add a record with the constructor value
+
 -- | Helper function used by both 'deriveFromJSON' and 'mkParseJSON'. Generates
 -- code to parse the JSON encoding of a number of constructors. All constructors
 -- must be from the same type.
@@ -326,90 +336,64 @@ consFromJSON tName withField [con] = do
   value <- newName "value"
   lam1E (varP value)
         $ caseE (varE value)
-                (parseArgs tName withField con)
+                (parseArgs tName withField False con)
+
 consFromJSON tName withField cons = do
-  value  <- newName "value"
-  obj    <- newName "obj"
-  conKey <- newName "conKey"
-  conVal <- newName "conVal"
+    value  <- newName "value"
+    lam1E (varP value)
+          $ caseE (varE value)
+                  $ concat [parseArgs tName withField True con | con <- cons]
 
-  let -- Convert the Data.Map inside the Object to a list and pattern match
-      -- against it. It must contain a single element otherwise the parse will
-      -- fail.
-      caseLst = caseE ([e|H.toList|] `appE` varE obj)
-                      [ match (listP [tupP [varP conKey, varP conVal]])
-                              (normalB caseKey)
-                              []
-                      , do other <- newName "other"
-                           match (varP other)
-                                 (normalB $ [|wrongPairCountFail|]
-                                            `appE` (litE $ stringL $ show tName)
-                                            `appE` ([|show . length|] `appE` varE other)
-                                 )
-                                 []
-                      ]
 
-      caseKey = caseE (varE conKey)
-                      [match wildP (guardedB guards) []]
-      guards = [ do g <- normalG $ infixApp (varE conKey)
-                                            [|(==)|]
-                                            ( [|T.pack|]
-                                              `appE` conNameExp con
-                                            )
-                    e <- caseE (varE conVal)
-                               (parseArgs tName withField con)
-                    return (g, e)
-               | con <- cons
-               ]
-               ++
-               [ liftM2 (,)
-                        (normalG [e|otherwise|])
-                        ( [|conNotFoundFail|]
-                          `appE` (litE $ stringL $ show tName)
-                          `appE` listE (map (litE . stringL . nameBase . getConName) cons)
-                          `appE` ([|T.unpack|] `appE` varE conKey)
-                        )
-               ]
+objectWrapper :: Name -> (Name -> Name -> ExpQ) -> [Q Match]
+objectWrapper conName expr = 
+  [ do obj <- newName "arg"
+       strcon <- newName "strcon"
+       val <- newName "val"
+       flip (match (conP 'Object [varP obj])) [] $ normalB $ doE [
+           bindS (varP strcon) ([e|(.: "constructor")|] `appE` (varE obj))
+         , bindS (varP val) ([e|(.: "value")|] `appE` (varE obj))
+         , guardConName conName val
+         , noBindS (expr conName val)]]
+-- HANDLE ERRORS!
 
-  lam1E (varP value)
-        $ caseE (varE value)
-                [ match (conP 'Object [varP obj])
-                        (normalB caseLst)
-                        []
-                , do other <- newName "other"
-                     match (varP other)
-                           ( normalB
-                           $ [|noObjectFail|]
-                             `appE` (litE $ stringL $ show tName)
-                             `appE` ([|valueConName|] `appE` varE other)
-                           )
-                           []
-                ]
+recWrapper :: Name -> Name -> (String -> String) -> Name -> [VarStrictType] -> [ExpQ]
+recWrapper tName conName withField obj ts = 
+    [ do
+          b <- isInstance ''Default [ty]
+          [|lookupField|]
+            `appE` (if b then [| Just def |] else [| Nothing|])
+            `appE` (litE $ stringL $ show tName)
+            `appE` (litE $ stringL $ nameBase conName)
+            `appE` (varE obj)
+            `appE` ( [e|T.pack|]
+                     `appE`
+                     fieldNameExp withField field
+                   )
+      | (field, _, ty) <- ts]
+
 
 -- | Generates code to parse the JSON encoding of a single constructor.
 parseArgs :: Name -- ^ Name of the type to which the constructor belongs.
           -> (String -> String) -- ^ Function to change field names.
+          -> Bool -- ^ Whether there are multiple constructors
           -> Con -- ^ Constructor for which to generate JSON parsing code.
           -> [Q Match]
 -- Nullary constructors.
-parseArgs tName _ (NormalC conName []) =
-    [ do arr <- newName "arr"
-         match (conP 'Array [varP arr])
-               ( normalB $ condE ([|V.null|] `appE` varE arr)
-                                 ([e|pure|] `appE` conE conName)
-                                 ( parseTypeMismatch tName conName
-                                     (litE $ stringL "an empty Array")
-                                     ( infixApp (litE $ stringL $ "Array of length ")
-                                                [|(++)|]
-                                                ([|show . V.length|] `appE` varE arr)
-                                     )
-                                 )
-               )
-               []
-    , matchFailed tName conName "Array"
+parseArgs tName _ _ (NormalC conName []) =
+    [ do str <- newName "str"
+         match (conP 'String [varP str])
+               ( normalB $
+                  caseE (varE str)
+                    [  match (litP $ stringL $ nameBase conName) (normalB $ [e|return|] `appE` conE conName) []
+                     , match wildP (normalB [| error "Not part of the enumeration"|]) []
+                       -- MAKE THE ERROR BETTER
+                    ]
+                ) []
+    , matchFailed tName conName "String"
     ]
 -- Unary constructors.
-parseArgs _ _ (NormalC conName [_]) =
+parseArgs _ _ False (NormalC conName [_]) =
     [ do arg <- newName "arg"
          match (varP arg)
                ( normalB $ infixApp (conE conName)
@@ -418,24 +402,18 @@ parseArgs _ _ (NormalC conName [_]) =
                )
                []
     ]
+parseArgs _ _ True (NormalC conName [_]) =
+    objectWrapper conName (\con val-> infixApp (conE con) [e|(<$>)|] ([e|parseJSON|] `appE` varE val))
+
 -- Polyadic constructors.
-parseArgs tName _ (NormalC conName ts) = parseProduct tName conName $ genericLength ts
+parseArgs tName _ False (NormalC conName ts) = parseProduct tName conName $ genericLength ts
+parseArgs tName _ True (NormalC conName ts) =
+  objectWrapper conName (\con val-> caseE (varE val) (parseProduct tName con $ genericLength ts))
+
 -- Records.
-parseArgs tName withField (RecC conName ts) =
+parseArgs tName withField False (RecC conName ts) =
     [ do obj <- newName "recObj"
-         let x:xs = [ do
-                        b <- isInstance ''Default [ty]
-                        [|lookupField|]
-                          `appE` (if b then [| Just def |] else [| Nothing|])
-                          `appE` (litE $ stringL $ show tName)
-                          `appE` (litE $ stringL $ nameBase conName)
-                          `appE` (varE obj)
-                          `appE` ( [e|T.pack|]
-                                   `appE`
-                                   fieldNameExp withField field
-                                 )
-                    | (field, _, ty) <- ts
-                    ]
+         let x:xs = recWrapper tName conName withField obj ts
          match (conP 'Object [varP obj])
                ( normalB $ ( foldl' (\a b -> infixApp a [|(<*>)|] b)
                                           (infixApp (conE conName) [|(<$>)|] x)
@@ -445,12 +423,36 @@ parseArgs tName withField (RecC conName ts) =
                []
     , matchFailed tName conName "Object"
     ]
+
+parseArgs tName withField True (RecC conName ts) =
+    [ do obj <- newName "recObj"
+         let xs = recWrapper tName conName withField obj ts
+             x  = [|lookupField Nothing|]
+                    `appE` (litE $ stringL $ show tName)
+                    `appE` (litE $ stringL $ nameBase conName)
+                    `appE` (varE obj)
+                    `appE` (litE $ stringL "constructor")
+         match (conP 'Object [varP obj])
+               ( normalB $ ( foldl' (\a b -> infixApp a [|(<*>)|] b)
+                                          (infixApp (conE conName) [|(<$>)|] x)
+                                          xs
+                                 )
+               )
+               []
+    , matchFailed tName conName "Object"
+    ]
+
 -- Infix constructors. Apart from syntax these are the same as
 -- polyadic constructors.
-parseArgs tName _ (InfixC _ conName _) = parseProduct tName conName 2
+parseArgs tName _ False (InfixC _ conName _) = parseProduct tName conName 2
+
+parseArgs tName _ True (InfixC _ conName _) =
+  objectWrapper conName (\con val -> caseE (varE val) (parseProduct tName con 2))
+
 -- Existentially quantified constructors. We ignore the quantifiers
 -- and proceed with the contained constructor.
-parseArgs tName withField (ForallC _ _ con) = parseArgs tName withField con
+parseArgs tName withField b (ForallC _ _ con) = parseArgs tName withField b con
+
 
 -- | Generates code to parse the JSON encoding of an n-ary
 -- constructor.
@@ -580,6 +582,9 @@ getConName (NormalC name _)  = name
 getConName (RecC name _)     = name
 getConName (InfixC _ name _) = name
 getConName (ForallC _ _ con) = getConName con
+
+guardConName :: Name -> Name -> Q Stmt
+guardConName conName varName = noBindS (infixApp (litE $ stringL $ nameBase conName) [e|(==)|] (varE varName))
 
 -- | Extracts the name from a type variable binder.
 tvbName :: TyVarBndr -> Name
