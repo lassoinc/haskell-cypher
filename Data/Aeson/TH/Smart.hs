@@ -1,11 +1,6 @@
 {-# LANGUAGE CPP, NoImplicitPrelude, TemplateHaskell, OverloadedStrings, ScopedTypeVariables #-}
 -- Shamelessly copied from Bryan O'Sullivan, 2011
 
--- HANDLE ERRORS BETTER
--- REFACTOR
--- RELEASE ON HACKAGE
--- TRY TO MERGE WITH ORIGINAL
-
 module Data.Aeson.TH.Smart
     ( deriveJSON
 
@@ -345,8 +340,8 @@ consFromJSON tName withField cons = do
                   $ concat [parseArgs tName withField True con | con <- cons]
 
 
-objectWrapper :: Name -> (Name -> Name -> ExpQ) -> [Q Match]
-objectWrapper conName expr = 
+objectWrapper :: Name -> Name -> (Name -> Name -> ExpQ) -> [Q Match]
+objectWrapper tName conName expr = 
   [ do obj <- newName "arg"
        strcon <- newName "strcon"
        val <- newName "val"
@@ -354,8 +349,9 @@ objectWrapper conName expr =
            bindS (varP strcon) ([e|(.: "constructor")|] `appE` (varE obj))
          , bindS (varP val) ([e|(.: "value")|] `appE` (varE obj))
          , guardConName conName val
-         , noBindS (expr conName val)]]
--- HANDLE ERRORS!
+         , noBindS (expr conName val)]
+    , matchFailed tName conName "Object"
+    ]
 
 recWrapper :: Name -> Name -> (String -> String) -> Name -> [VarStrictType] -> [ExpQ]
 recWrapper tName conName withField obj ts = 
@@ -386,8 +382,7 @@ parseArgs tName _ _ (NormalC conName []) =
                ( normalB $
                   caseE (varE str)
                     [  match (litP $ stringL $ nameBase conName) (normalB $ [e|return|] `appE` conE conName) []
-                     , match wildP (normalB [| error "Not part of the enumeration"|]) []
-                       -- MAKE THE ERROR BETTER
+                     , match wildP (normalB $ wrongEnumerationError tName str) []
                     ]
                 ) []
     , matchFailed tName conName "String"
@@ -402,13 +397,13 @@ parseArgs _ _ False (NormalC conName [_]) =
                )
                []
     ]
-parseArgs _ _ True (NormalC conName [_]) =
-    objectWrapper conName (\con val-> infixApp (conE con) [e|(<$>)|] ([e|parseJSON|] `appE` varE val))
+parseArgs tName _ True (NormalC conName [_]) =
+    objectWrapper tName conName (\con val-> infixApp (conE con) [e|(<$>)|] ([e|parseJSON|] `appE` varE val))
 
 -- Polyadic constructors.
 parseArgs tName _ False (NormalC conName ts) = parseProduct tName conName $ genericLength ts
 parseArgs tName _ True (NormalC conName ts) =
-  objectWrapper conName (\con val-> caseE (varE val) (parseProduct tName con $ genericLength ts))
+  objectWrapper tName conName (\con val-> caseE (varE val) (parseProduct tName con $ genericLength ts))
 
 -- Records.
 parseArgs tName withField False (RecC conName ts) =
@@ -447,7 +442,7 @@ parseArgs tName withField True (RecC conName ts) =
 parseArgs tName _ False (InfixC _ conName _) = parseProduct tName conName 2
 
 parseArgs tName _ True (InfixC _ conName _) =
-  objectWrapper conName (\con val -> caseE (varE val) (parseProduct tName con 2))
+  objectWrapper tName conName (\con val -> caseE (varE val) (parseProduct tName con 2))
 
 -- Existentially quantified constructors. We ignore the quantifiers
 -- and proceed with the contained constructor.
@@ -491,6 +486,13 @@ parseProduct tName conName numArgs =
     , matchFailed tName conName "Array"
     ]
 
+lookupField :: (FromJSON a) => Maybe a -> String -> String -> Object -> T.Text -> Parser a
+lookupField d tName rec obj key =
+    case H.lookup key obj of
+      Nothing -> case d of
+        Nothing -> unknownFieldFail tName rec (T.unpack key)
+        Just x -> return x
+      Just v  -> parseJSON v
 
 --------------------------------------------------------------------------------
 -- Parsing errors
@@ -516,13 +518,9 @@ parseTypeMismatch tName conName expected actual =
           , actual
           ]
 
-lookupField :: (FromJSON a) => Maybe a -> String -> String -> Object -> T.Text -> Parser a
-lookupField d tName rec obj key =
-    case H.lookup key obj of
-      Nothing -> case d of
-        Nothing -> unknownFieldFail tName rec (T.unpack key)
-        Just x -> return x
-      Just v  -> parseJSON v
+wrongEnumerationError :: Name -> Name -> ExpQ
+wrongEnumerationError tName str = 
+      [|wrongEnumerationError'|] `appE` (litE $ stringL $ nameBase tName) `appE` ([|T.unpack|] `appE` varE str)
 
 unknownFieldFail :: String -> String -> String -> Parser fail
 unknownFieldFail tName rec key =
@@ -548,6 +546,8 @@ parseTypeMismatch' tName conName expected actual =
     fail $ printf "When parsing the constructor %s of type %s expected %s but got %s."
                   conName tName expected actual
 
+wrongEnumerationError' :: String -> String -> Parser fail
+wrongEnumerationError' tName str = fail $ printf (str ++ " is not a data constructor for type " ++ tName)
 
 --------------------------------------------------------------------------------
 -- Utility functions
