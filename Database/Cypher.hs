@@ -1,16 +1,24 @@
 {-# LANGUAGE OverloadedStrings, TemplateHaskell, DeriveDataTypeable, ScopedTypeVariables, FlexibleInstances #-}
 module Database.Cypher (
 	Cypher,
-	Entity,
+	Entity(..),
 	CypherResult(..),
+	LuceneQuery,
 	runCypher,
 	cypher,
+	cypherCreate,
+	cypherGet,
+	cypherSet,
+	luceneEncode,
 	CypherException(..),
+	DBInfo(..),
 	Hostname,
 	Port,
-	OneTuple(..)
+	OneTuple(..),
+	FromCypher(..),
 	) where
 
+import Database.Cypher.Lucene
 import Data.Aeson
 import Data.Aeson.TH
 import Data.Aeson.Types
@@ -24,17 +32,23 @@ import Control.Exception
 import Control.Applicative
 import Control.Monad
 import Data.Monoid
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Class
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Lazy as L
 
-data DBInfo = DBInfo Hostname Port Manager
+-- | Information about your neo4j configuration needed to make requests over the REST api.
+data DBInfo = DBInfo {
+	cypher_hostname :: Hostname,
+	cypher_port :: Port
+}
+
 type Hostname = S.ByteString
 type Port = Int
+$(deriveJSON (drop 7) ''DBInfo)
 
--- | All interaction with Neo4j is done through the Cypher monad. Use "cypher" to add a query to the monad.
+-- | All interaction with Neo4j is done through the Cypher monad. Use 'cypher' to add a query to the monad.
 newtype Cypher a = Cypher {
-	uncypher :: (DBInfo -> ResourceT IO a)
+	uncypher :: ((DBInfo, Manager) -> ResourceT IO a)
 }
 
 -- | Raw result data returned by Neo4j. Only use this if you care about column headers.
@@ -88,6 +102,9 @@ instance Monad Cypher where
 			a <- cmd con
 			uncypher (f a) con
 
+instance MonadIO Cypher where
+	liftIO f = Cypher $ const (liftIO f)
+
 class FromCypher a where
 	fromCypher :: L.ByteString -> a
 
@@ -133,7 +150,7 @@ instance FromJSON a => FromCypher (Maybe a) where
 
 -- | Perform a cypher query
 cypher :: FromCypher a => Text -> Value -> Cypher a
-cypher txt params = Cypher $ \(DBInfo h p m)-> do
+cypher txt params = Cypher $ \(DBInfo h p, m)-> do
 	let req = def { host = h, port = p,
 					path = "db/data/cypher",
 					requestBody = RequestBodyLBS (encode $ CypherRequest txt params),
@@ -146,10 +163,29 @@ cypher txt params = Cypher $ \(DBInfo h p m)-> do
 	if 200 <= sci && sci < 300 then return (fromCypher (responseBody r))
 		else throw $ CypherServerException (responseStatus r) (responseHeaders r) (responseBody r)
 
+-- | Get the http connection manager for a Cypher monad
+getManager :: Cypher Manager
+getManager = Cypher (\(_,m)-> return m)
+
+-- | Create a node with the properties of the given datatype.
+cypherCreate :: (Functor f, ToJSON a, FromCypher (f (OneTuple a))) => a -> Cypher (f a)
+cypherCreate obj = 
+	liftM (fmap (\(OneTuple x)-> x)) $
+		cypher "create (a {obj}) return a" $ object ["obj" .= obj]
+
+-- | Set a node with properties matching the first argument to have the properties of the second.
+cypherSet :: (ToJSON a, FromJSON a) => a -> a -> Cypher a
+cypherSet a b = do
+    (OneTuple x) <- cypher "start n=node({a}) set n = {b} return n" (object ["a" .= a, "b" .= b])
+    return x
+
+-- | Get the nodes matching the given lucene query
+cypherGet :: (Functor f, FromCypher (f (OneTuple a))) => LuceneQuery -> Cypher (f a)
+cypherGet lc = liftM (fmap (\(OneTuple x)-> x)) $ cypher "start a = node:node_auto_index({lc}) return a" $ object ["lc" .= lc]
+
 -- | Execute some number of cypher queries
-runCypher :: Cypher a -> Hostname -> Port -> IO a
-runCypher c h p =
+runCypher :: Cypher a -> DBInfo -> Manager -> IO a
+runCypher c dbi m =
 	runResourceT $ do
-    	manager <- liftIO $ newManager def
-    	uncypher c (DBInfo h p manager)
+    	uncypher c (dbi, m)
 
