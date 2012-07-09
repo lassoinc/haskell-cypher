@@ -47,7 +47,7 @@ source-repository head
 
 Library
   -- Modules exported by the library.
-  Exposed-modules:     Database.Cypher, Database.Cypher.Lucene, Data.Aeson.TH.Smart, Data.Default.TH
+  Exposed-modules:     Database.Cypher, Database.Cypher.Lucene, Data.Aeson.TH.Smart, Data.Default.NewTH
   
   -- Packages needed in order to build this package.
   Build-depends:         base < 5
@@ -61,7 +61,6 @@ Library
                        , vector <1
                        , unordered-containers <1
                        , attoparsec <1
-                       , OneTuple <1
                        , data-default <1
                        , template-haskell >= 2.7
   

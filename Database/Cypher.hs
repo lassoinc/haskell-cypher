@@ -10,12 +10,17 @@ module Database.Cypher (
 	cypherGet,
 	cypherSet,
 	luceneEncode,
+	withCypherManager,
 	CypherException(..),
 	DBInfo(..),
 	Hostname,
 	Port,
-	OneTuple(..),
-	FromCypher(..),
+	CypherVal(..),
+	CypherVals(..),
+	CypherCol(..),
+	CypherCols(..),
+	CypherMaybe(..),
+	CypherUnit(..)
 	) where
 
 import Database.Cypher.Lucene
@@ -27,7 +32,6 @@ import Network.HTTP.Types
 import Data.Conduit
 import Data.Typeable
 import Data.Text (Text)
-import Data.Tuple.OneTuple
 import Control.Exception
 import Control.Applicative
 import Control.Monad
@@ -57,6 +61,24 @@ data CypherResult a = CypherResult {
 	resdata :: a
 } deriving (Show, Eq)
 
+-- | A single result returned by Neo4j.
+newtype CypherVal a = CypherVal a
+
+-- | A single column returned by Neo4j.
+newtype CypherCol a = CypherCol a
+
+-- | Columns returned by Neo4j.
+newtype CypherCols a = CypherCols a
+
+-- | Values returned by Neo4j.
+newtype CypherVals a = CypherVals [a]
+
+-- | Possibly a value returned by Neo4j
+data CypherMaybe a = CypherJust a | CypherNothing
+
+-- | No value returned from Neo4j
+data CypherUnit = CypherUnit
+
 data CypherRequest = CypherRequest {
 	req_query :: Text,
 	req_params :: Value
@@ -76,14 +98,6 @@ instance FromJSON a => FromJSON (Entity a) where
 
 instance ToJSON (Entity a) where
 	toJSON = toJSON . entity_id
-
-instance FromJSON a => FromJSON (OneTuple a) where
-	parseJSON x = do
-		[l] <- parseJSON x
-		return $ OneTuple l
-
-instance ToJSON a => ToJSON (OneTuple a) where
-	toJSON = toJSON . (\x->[x])
 
 $(deriveJSON (drop 3) ''CypherResult)
 $(deriveJSON (drop 4) ''CypherRequest)
@@ -105,51 +119,41 @@ instance Monad Cypher where
 instance MonadIO Cypher where
 	liftIO f = Cypher $ const (liftIO f)
 
-class FromCypher a where
-	fromCypher :: L.ByteString -> a
+instance FromJSON a => FromJSON (CypherVal a) where
+	parseJSON x = do
+		(CypherResult _ [[d]]) <- parseJSON x
+		return $ CypherVal d
 
-instance FromCypher () where
-	fromCypher _ = ()
+instance FromJSON a => FromJSON (CypherCol a) where
+	parseJSON x = do
+		(CypherResult _ [d]) <- parseJSON x
+		return $ CypherCol d
 
-instance FromJSON a => FromCypher (CypherResult a) where
-	fromCypher bs = 
-		case decode bs of
-			Just x -> x
-			Nothing -> throwClientParse bs
+instance FromJSON a => FromJSON (CypherCols a) where
+	parseJSON x = do
+		(CypherResult _ d) <- parseJSON x
+		return $ CypherCols d
 
-instance FromJSON a => FromCypher [a] where
-	fromCypher bs =
- 		case decode bs of
-			Just (CypherResult _ ds) -> ds
-			_ -> throwClientParse bs
+instance FromJSON a => FromJSON (CypherVals a) where
+	parseJSON x = do
+		(CypherResult _ d) <- parseJSON x
+		liftM CypherVals (mapM safeHead d)
 
-instance FromJSON a => FromCypher (OneTuple a) where
-	fromCypher bs =
-		case decode bs of
-			Just (CypherResult _ [d]) -> d
-			_ -> throwClientParse bs
+instance FromJSON a => FromJSON (CypherMaybe a) where
+	parseJSON x = do
+		(CypherResult _ ds) <- parseJSON x
+		case ds of
+			[[d]] -> return $ CypherJust d
+			_ -> return CypherNothing
 
-instance (FromJSON a, FromJSON b) => FromCypher (a,b) where
-	fromCypher bs =
-		case decode bs of
-			Just (CypherResult _ [d]) -> d
-			_ -> throwClientParse bs
+instance FromJSON CypherUnit where parseJSON _ = return CypherUnit
 
-instance (FromJSON a, FromJSON b, FromJSON c) => FromCypher (a,b,c) where
-	fromCypher bs =
-		case decode bs of
-			Just (CypherResult _ [d]) -> d
-			_ -> throwClientParse bs
-
-instance FromJSON a => FromCypher (Maybe a) where
-	fromCypher bs =
-		case decode bs of
-			Just (CypherResult _ [a]) -> Just a
-			Just (CypherResult _ []) -> Nothing
-			_ -> throwClientParse bs
+safeHead :: [a] -> Parser a
+safeHead [a] = return a
+safeHead _ = mzero
 
 -- | Perform a cypher query
-cypher :: FromCypher a => Text -> Value -> Cypher a
+cypher :: FromJSON a => Text -> Value -> Cypher a
 cypher txt params = Cypher $ \(DBInfo h p, m)-> do
 	let req = def { host = h, port = p,
 					path = "db/data/cypher",
@@ -160,28 +164,29 @@ cypher txt params = Cypher $ \(DBInfo h p, m)-> do
 				  }
 	r <- httpLbs req m
 	let sci = statusCode (responseStatus r)
-	if 200 <= sci && sci < 300 then return (fromCypher (responseBody r))
+	if 200 <= sci && sci < 300
+		then (case decode (responseBody r) of
+				Nothing -> throwClientParse (responseBody r)
+				Just x-> return x)
 		else throw $ CypherServerException (responseStatus r) (responseHeaders r) (responseBody r)
 
 -- | Get the http connection manager for a Cypher monad
-getManager :: Cypher Manager
-getManager = Cypher (\(_,m)-> return m)
+withCypherManager :: (Manager -> ResourceT IO a) -> Cypher a
+withCypherManager f = Cypher (\(_,m)-> f m)
 
 -- | Create a node with the properties of the given datatype.
-cypherCreate :: (Functor f, ToJSON a, FromCypher (f (OneTuple a))) => a -> Cypher (f a)
-cypherCreate obj = 
-	liftM (fmap (\(OneTuple x)-> x)) $
-		cypher "create (a {obj}) return a" $ object ["obj" .= obj]
+cypherCreate :: (ToJSON a, FromJSON b) => a -> Cypher b
+cypherCreate obj = cypher "create (a {obj}) return a" $ object ["obj" .= obj]
 
 -- | Set a node with properties matching the first argument to have the properties of the second.
-cypherSet :: (ToJSON a, FromJSON a) => a -> a -> Cypher a
+cypherSet :: (ToJSON a, ToJSON a1, FromJSON b) => a -> a1 -> Cypher b
 cypherSet a b = do
-    (OneTuple x) <- cypher "start n=node({a}) set n = {b} return n" (object ["a" .= a, "b" .= b])
+    (CypherVal x) <- cypher "start n=node({a}) set n = {b} return n" (object ["a" .= a, "b" .= b])
     return x
 
 -- | Get the nodes matching the given lucene query
-cypherGet :: (Functor f, FromCypher (f (OneTuple a))) => LuceneQuery -> Cypher (f a)
-cypherGet lc = liftM (fmap (\(OneTuple x)-> x)) $ cypher "start a = node:node_auto_index({lc}) return a" $ object ["lc" .= lc]
+cypherGet :: (ToJSON a1, FromJSON a) => a1 -> Cypher a
+cypherGet lc = cypher "start a = node:node_auto_index({lc}) return a" $ object ["lc" .= lc]
 
 -- | Execute some number of cypher queries
 runCypher :: Cypher a -> DBInfo -> Manager -> IO a
