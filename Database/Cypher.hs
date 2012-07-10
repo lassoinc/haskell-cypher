@@ -230,7 +230,7 @@ cypherSet e obj = Cypher $ \(DBInfo h p, m)-> do
 	if 200 <= sci && sci < 300
 		then return ()
 		else (let e = CypherServerException (responseStatus r) (responseHeaders r) (responseBody r)
-			 in traceShow e (throw e))
+			 in throw e)
 
 -- | Get the nodes matching the given lucene query
 cypherGet :: (ToJSON a1, FromJSON a) => a1 -> Cypher a
