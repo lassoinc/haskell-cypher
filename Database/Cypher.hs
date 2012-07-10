@@ -6,6 +6,7 @@ module Database.Cypher (
 	LuceneQuery,
 	runCypher,
 	cypher,
+	cypherGetNode,
 	cypherCreate,
 	cypherGet,
 	cypherSet,
@@ -39,12 +40,16 @@ import Data.Monoid
 import Control.Monad.IO.Class
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Lazy as L
+import Data.Text.Lazy.Encoding (encodeUtf8)
+import qualified Data.HashMap.Strict as H
+import Data.Text.Lazy.Builder
+import Data.Aeson.Encode
 
 -- | Information about your neo4j configuration needed to make requests over the REST api.
 data DBInfo = DBInfo {
 	cypher_hostname :: Hostname,
 	cypher_port :: Port
-}
+} deriving (Show, Eq)
 
 type Hostname = S.ByteString
 type Port = Int
@@ -62,22 +67,22 @@ data CypherResult a = CypherResult {
 } deriving (Show, Eq)
 
 -- | A single result returned by Neo4j.
-newtype CypherVal a = CypherVal a
+newtype CypherVal a = CypherVal a deriving (Eq, Show)
 
 -- | A single column returned by Neo4j.
-newtype CypherCol a = CypherCol a
+newtype CypherCol a = CypherCol a deriving (Eq, Show)
 
 -- | Columns returned by Neo4j.
-newtype CypherCols a = CypherCols a
+newtype CypherCols a = CypherCols a deriving (Eq, Show)
 
 -- | Values returned by Neo4j.
-newtype CypherVals a = CypherVals [a]
+newtype CypherVals a = CypherVals [a] deriving (Eq, Show)
 
 -- | Possibly a value returned by Neo4j
-data CypherMaybe a = CypherJust a | CypherNothing
+data CypherMaybe a = CypherJust a | CypherNothing deriving (Eq, Show)
 
 -- | No value returned from Neo4j
-data CypherUnit = CypherUnit
+data CypherUnit = CypherUnit deriving (Show)
 
 data CypherRequest = CypherRequest {
 	req_query :: Text,
@@ -86,13 +91,15 @@ data CypherRequest = CypherRequest {
 
 -- | A neo4j node or edge
 data Entity a = Entity {
-	entity_id :: Text,
+	entity_id :: String,
+	entity_properties :: String,
 	entity_data :: a
 } deriving (Show, Eq)
 
 instance FromJSON a => FromJSON (Entity a) where
 	parseJSON (Object v) = Entity <$>
 							v .: "self" <*>
+							v .: "properties" <*>
 							v .: "data"
 	parseJSON _ = mempty
 
@@ -170,27 +177,71 @@ cypher txt params = Cypher $ \(DBInfo h p, m)-> do
 				Just x-> return x)
 		else throw $ CypherServerException (responseStatus r) (responseHeaders r) (responseBody r)
 
--- | Get the http connection manager for a Cypher monad
-withCypherManager :: (Manager -> ResourceT IO a) -> Cypher a
-withCypherManager f = Cypher (\(_,m)-> f m)
-
--- | Create a node with the properties of the given datatype.
+-- | Create a cypher node
 cypherCreate :: (ToJSON a, FromJSON b) => a -> Cypher b
-cypherCreate obj = cypher "create (a {obj}) return a" $ object ["obj" .= obj]
+cypherCreate obj = Cypher $ \(DBInfo h p, m)-> do
+	let req = def { host = h, port = p,
+					path = "db/data/node",
+					requestBody = RequestBodyLBS (encode obj),
+					requestHeaders = headerAccept "application/json" : headerContentType "application/json" : requestHeaders def,
+					method = "POST",
+					checkStatus = (\_ _-> Nothing)
+				  }
+	r <- httpLbs req m
+	let sci = statusCode (responseStatus r)
+	if 200 <= sci && sci < 300
+		then (case decode (responseBody r) of
+				Nothing -> throwClientParse (responseBody r)
+				Just x-> return x)
+		else throw $ CypherServerException (responseStatus r) (responseHeaders r) (responseBody r)
 
--- | Set a node with properties matching the first argument to have the properties of the second.
-cypherSet :: (ToJSON a, ToJSON a1, FromJSON b) => a -> a1 -> Cypher b
-cypherSet a b = do
-    (CypherVal x) <- cypher "start n=node({a}) set n = {b} return n" (object ["a" .= a, "b" .= b])
-    return x
+-- | Get a cypher node
+cypherGetNode :: FromJSON b => Entity b -> Cypher (Entity b)
+cypherGetNode e = Cypher $ \(DBInfo h p, m)-> do
+	req <- liftIO $ parseUrl (entity_id e)
+	let req' = req { host = h, port = p,
+					requestHeaders = headerAccept "application/json" : headerContentType "application/json" : requestHeaders def,
+					method = "GET",
+					checkStatus = (\_ _-> Nothing)
+				  }
+	r <- httpLbs req m
+	let sci = statusCode (responseStatus r)
+	if 200 <= sci && sci < 300
+		then (case decode (responseBody r) of
+				Nothing -> throwClientParse (responseBody r)
+				Just x-> return x)
+		else throw $ CypherServerException (responseStatus r) (responseHeaders r) (responseBody r)
+
+-- | Set cypher properties. This currently cannot be done through cypher queries.
+cypherSet :: (ToJSON a, ToJSON a1) => (Entity a) -> a1 -> Cypher ()
+cypherSet e obj = Cypher $ \(DBInfo h p, m)-> do
+	let Object o1 = toJSON (entity_data e)
+	let Object o2 = toJSON obj
+	let body = RequestBodyLBS $ encodeUtf8 $ toLazyText $ fromValue $ Object (o2 `H.union` o1)
+	req <- liftIO $ parseUrl (entity_properties e)
+	let req' = req { host = h, port = p,
+					requestBody = body,
+					requestHeaders = headerAccept "application/json" : headerContentType "application/json" : requestHeaders def,
+					method = "PUT",
+					checkStatus = (\_ _-> Nothing)
+				  }
+	r <- httpLbs req' m
+	let sci = statusCode (responseStatus r)
+	if 200 <= sci && sci < 300
+		then return ()
+		else (let e = CypherServerException (responseStatus r) (responseHeaders r) (responseBody r)
+			 in traceShow e (throw e))
 
 -- | Get the nodes matching the given lucene query
 cypherGet :: (ToJSON a1, FromJSON a) => a1 -> Cypher a
 cypherGet lc = cypher "start a = node:node_auto_index({lc}) return a" $ object ["lc" .= lc]
+
+-- | Get the http connection manager for a Cypher monad
+withCypherManager :: (Manager -> ResourceT IO a) -> Cypher a
+withCypherManager f = Cypher (\(_,m)-> f m)
 
 -- | Execute some number of cypher queries
 runCypher :: Cypher a -> DBInfo -> Manager -> IO a
 runCypher c dbi m =
 	runResourceT $ do
     	uncypher c (dbi, m)
-

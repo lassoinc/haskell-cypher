@@ -1,9 +1,6 @@
 {-# LANGUAGE CPP, NoImplicitPrelude, TemplateHaskell, OverloadedStrings, ScopedTypeVariables #-}
 -- Shamelessly copied from Bryan O'Sullivan, 2011
 
--- EVENTUALLY MAKE THIS WORK BY GETTING THE CONSTRUCTOR BEFOREHAND.
--- 
-
 module Data.Aeson.TH.Smart
     ( deriveJSON
 
@@ -37,7 +34,7 @@ import Data.List           ( (++), foldl, foldl', intercalate
                            )
 import Data.Maybe          ( Maybe(Nothing, Just) )
 import Prelude             ( String, (-), Integer, fromIntegral, not,
-                             error, filter, fst, snd, Bool(..), flip, maybe)
+                             error, filter, fst, snd, Bool(..), flip, maybe, (>))
 import Text.Printf         ( printf )
 import Text.Show           ( show )
 #if __GLASGOW_HASKELL__ < 700
@@ -210,7 +207,7 @@ encodeArgs wrapper _ (NormalC conName ts) = do
                                     litE (integerL ix) `appE` e | (ix, e) <- zip [(0::Integer)..] es]
                      ret = noBindS $ [e|return|] `appE` varE mv
                      fltr = [e| V.filter (not . (== Null))|]
-                 [e|Array|] `appE` (fltr `appE` (varE 'V.create `appE` doE (newMV:stmts++[ret])))
+                 [e|\x-> if V.length x > 0 then Array x else Null|] `appE` (fltr `appE` (varE 'V.create `appE` doE (newMV:stmts++[ret])))
     let b = case wrapper of
               Nothing -> js
               (Just wrapper') -> wrapper' [infixApp (litE (stringL "value")) [e|(.=)|] js]
@@ -223,7 +220,7 @@ encodeArgs withExp withField (RecC conName ts) = do
              | (arg, (field, _, _)) <- zip args' ts
              ]
     let b = case withExp of
-              Nothing -> [e|object|] `appE` ([e| filter (not . (==Null) . snd) |] `appE` listE js)
+              Nothing -> [e|object|] `appE` ([e| filter (not . disposable . snd) |] `appE` listE js)
               (Just wrapper) -> wrapper js
     match (conP conName $ map varP args) (normalB b) []
 -- Infix constructors.
@@ -238,6 +235,10 @@ encodeArgs withExp _ (InfixC _ conName _) = do
 -- Existentially quantified constructors.
 encodeArgs withExp withField (ForallC _ _ con) =
     encodeArgs withExp withField con
+
+disposable Null = True
+disposable (Array x) = V.null x
+disposable _ = False
 
 --------------------------------------------------------------------------------
 -- FromJSON
