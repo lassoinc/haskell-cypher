@@ -435,7 +435,7 @@ noMatch tName = do
   other <- newName "other"
   flip (match (varP other)) []
     (normalB $ [| fail $ printf "No constructors for type %s were present." |]
-      `appE` (litE $ stringL $ nameBase tName))
+      `appE` (sigE (litE $ stringL $ nameBase tName) (conT ''String)))
 
 parseTypeMismatch :: Name -> Name -> ExpQ -> ExpQ -> ExpQ
 parseTypeMismatch tName conName expected actual =
