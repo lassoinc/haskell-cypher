@@ -44,6 +44,7 @@ import Data.Text.Lazy.Encoding (encodeUtf8)
 import qualified Data.HashMap.Strict as H
 import Data.Text.Lazy.Builder
 import Data.Aeson.Encode
+import Data.List (elemIndices)
 
 -- | Information about your neo4j configuration needed to make requests over the REST api.
 data DBInfo = DBInfo {
@@ -104,7 +105,8 @@ instance FromJSON a => FromJSON (Entity a) where
 	parseJSON _ = mempty
 
 instance ToJSON (Entity a) where
-	toJSON = toJSON . entity_id
+	toJSON a = toJSON (read x :: Int) where
+		(_, _:x) = splitAt (last (elemIndices '/' (entity_id a))) (entity_id a)
 
 $(deriveJSON (drop 3) ''CypherResult)
 $(deriveJSON (drop 4) ''CypherRequest)
