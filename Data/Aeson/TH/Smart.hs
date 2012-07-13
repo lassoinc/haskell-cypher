@@ -432,8 +432,7 @@ lookupField d tName rec obj key =
 
 noMatch :: Name -> MatchQ
 noMatch tName = do
-  other <- newName "other"
-  flip (match (varP other)) []
+  flip (match wildP) []
     (normalB $ [| fail $ printf "No constructors for type %s were present." |]
       `appE` (sigE (litE $ stringL $ nameBase tName) (conT ''String)))
 
