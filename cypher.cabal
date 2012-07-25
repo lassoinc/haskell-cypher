@@ -7,7 +7,7 @@ Name:                cypher
 -- The package version. See the Haskell package versioning policy
 -- (http://www.haskell.org/haskellwiki/Package_versioning_policy) for
 -- standards guiding when and how versions should be incremented.
-Version:             0.7
+Version:             0.8
 
 -- A short (one-line) description of the package.
 Synopsis:            Haskell bindings for the neo4j "cypher" query language
@@ -47,22 +47,21 @@ source-repository head
 
 Library
   -- Modules exported by the library.
-  Exposed-modules:     Database.Cypher, Database.Cypher.Lucene, Data.Aeson.TH.Smart, Data.Default.NewTH
+  Exposed-modules:     Database.Cypher, Database.Cypher.Lucene
   
   -- Packages needed in order to build this package.
   Build-depends:         base < 5
                        , aeson
+                       , unordered-containers
+                       , vector == 0.9.*
                        , http-conduit
                        , transformers
                        , conduit
                        , text
                        , bytestring
                        , http-types <1
-                       , vector <1
-                       , unordered-containers <1
                        , attoparsec <1
-                       , data-default <1
-                       , template-haskell >= 2.7
+                       , resourcet == 0.3.*
   
   -- Modules not exported by this package.
   -- Other-modules:       

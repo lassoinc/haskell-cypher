@@ -5,6 +5,7 @@ module Database.Cypher (
 	CypherResult(..),
 	LuceneQuery,
 	runCypher,
+	forkCypher,
 	cypher,
 	cypherGetNode,
 	cypherCreate,
@@ -45,6 +46,7 @@ import qualified Data.HashMap.Strict as H
 import Data.Text.Lazy.Builder
 import Data.Aeson.Encode
 import Data.List (elemIndices)
+import Control.Monad.Trans.Resource
 
 -- | Information about your neo4j configuration needed to make requests over the REST api.
 data DBInfo = DBInfo {
@@ -247,3 +249,7 @@ runCypher :: Cypher a -> DBInfo -> Manager -> IO a
 runCypher c dbi m =
 	runResourceT $ do
     	uncypher c (dbi, m)
+
+-- | Execute a request in a separate thread
+forkCypher :: Cypher () -> Cypher ()
+forkCypher (Cypher cmd) = Cypher (\d-> resourceForkIO (cmd d) >> return ())
