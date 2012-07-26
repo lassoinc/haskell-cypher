@@ -20,6 +20,7 @@ import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import qualified Data.Vector as V
 
+-- | A Lucene query to be translated into a JSON Value
 type LuceneQuery = L.ByteString
 
 (.>.) :: ToJSON a => T.Text -> a -> LuceneQuery

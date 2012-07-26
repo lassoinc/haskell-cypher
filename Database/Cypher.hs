@@ -1,11 +1,15 @@
 {-# LANGUAGE OverloadedStrings, TemplateHaskell, DeriveDataTypeable, ScopedTypeVariables, FlexibleInstances #-}
 module Database.Cypher (
-	Cypher,
+	Cypher(..),
+	SubCypher,
 	Entity(..),
 	CypherResult(..),
 	LuceneQuery,
 	runCypher,
+	withCons,
+	cypherIO,
 	forkCypher,
+	forkSubCypher,
 	cypher,
 	cypherGetNode,
 	cypherCreate,
@@ -47,6 +51,7 @@ import Data.Text.Lazy.Builder
 import Data.Aeson.Encode
 import Data.List (elemIndices)
 import Control.Monad.Trans.Resource
+import Control.Concurrent
 
 -- | Information about your neo4j configuration needed to make requests over the REST api.
 data DBInfo = DBInfo {
@@ -60,7 +65,12 @@ $(deriveJSON (drop 7) ''DBInfo)
 
 -- | All interaction with Neo4j is done through the Cypher monad. Use 'cypher' to add a query to the monad.
 newtype Cypher a = Cypher {
-	uncypher :: ((DBInfo, Manager) -> ResourceT IO a)
+	uncypher :: ((DBInfo, Manager) -> IO a)
+}
+
+-- | Sequential commands in the SubCypher monad that can share the same connections.
+newtype SubCypher a = SubCypher {
+	unSubCypher :: ((DBInfo, Manager) -> ResourceT IO a)
 }
 
 -- | Raw result data returned by Neo4j. Only use this if you care about column headers.
@@ -127,8 +137,18 @@ instance Monad Cypher where
 			a <- cmd con
 			uncypher (f a) con
 
+instance Monad SubCypher where
+	return a = SubCypher (const (return a))
+	(SubCypher  cmd) >>= f =
+		SubCypher $ \con-> do
+			a <- cmd con
+			unSubCypher (f a) con
+
+instance MonadIO SubCypher where
+	liftIO f = SubCypher $ const (liftIO f)
+
 instance MonadIO Cypher where
-	liftIO f = Cypher $ const (liftIO f)
+	liftIO f = Cypher $ const f
 
 instance FromJSON a => FromJSON (CypherVal a) where
 	parseJSON x = do
@@ -164,8 +184,8 @@ safeHead [a] = return a
 safeHead _ = mzero
 
 -- | Perform a cypher query
-cypher :: FromJSON a => Text -> Value -> Cypher a
-cypher txt params = Cypher $ \(DBInfo h p, m)-> do
+cypher :: FromJSON a => Text -> Value -> SubCypher a
+cypher txt params = SubCypher $ \(DBInfo h p, m)-> do
 	let req = def { host = h, port = p,
 					path = "db/data/cypher",
 					requestBody = RequestBodyLBS (encode $ CypherRequest txt params),
@@ -181,9 +201,13 @@ cypher txt params = Cypher $ \(DBInfo h p, m)-> do
 				Just x-> return x)
 		else throw $ CypherServerException (responseStatus r) (responseHeaders r) (responseBody r)
 
+-- | Perform cypher queries, possibly reusing connections.
+withCons :: SubCypher a -> Cypher a
+withCons (SubCypher f) = Cypher $ \d-> runResourceT (f d)
+
 -- | Create a cypher node
-cypherCreate :: (ToJSON a, FromJSON b) => a -> Cypher b
-cypherCreate obj = Cypher $ \(DBInfo h p, m)-> do
+cypherCreate :: (ToJSON a, FromJSON b) => a -> SubCypher b
+cypherCreate obj = SubCypher $ \(DBInfo h p, m)-> do
 	let req = def { host = h, port = p,
 					path = "db/data/node",
 					requestBody = RequestBodyLBS (encode obj),
@@ -200,8 +224,8 @@ cypherCreate obj = Cypher $ \(DBInfo h p, m)-> do
 		else throw $ CypherServerException (responseStatus r) (responseHeaders r) (responseBody r)
 
 -- | Get a cypher node
-cypherGetNode :: FromJSON b => Entity b -> Cypher (Entity b)
-cypherGetNode e = Cypher $ \(DBInfo h p, m)-> do
+cypherGetNode :: FromJSON b => Entity b -> SubCypher (Entity b)
+cypherGetNode e = SubCypher $ \(DBInfo h p, m)-> do
 	req <- liftIO $ parseUrl (entity_id e)
 	let req' = req { host = h, port = p,
 					requestHeaders = headerAccept "application/json" : headerContentType "application/json" : requestHeaders def,
@@ -217,8 +241,8 @@ cypherGetNode e = Cypher $ \(DBInfo h p, m)-> do
 		else throw $ CypherServerException (responseStatus r) (responseHeaders r) (responseBody r)
 
 -- | Set cypher properties. This currently cannot be done through cypher queries.
-cypherSet :: (ToJSON a, ToJSON a1) => (Entity a) -> a1 -> Cypher ()
-cypherSet e obj = Cypher $ \(DBInfo h p, m)-> do
+cypherSet :: (ToJSON a, ToJSON a1) => (Entity a) -> a1 -> SubCypher ()
+cypherSet e obj = SubCypher $ \(DBInfo h p, m)-> do
 	let Object o1 = toJSON (entity_data e)
 	let Object o2 = toJSON obj
 	let body = RequestBodyLBS $ encodeUtf8 $ toLazyText $ fromValue $ Object (o2 `H.union` o1)
@@ -237,19 +261,26 @@ cypherSet e obj = Cypher $ \(DBInfo h p, m)-> do
 			 in throw e)
 
 -- | Get the nodes matching the given lucene query
-cypherGet :: (ToJSON a1, FromJSON a) => a1 -> Cypher a
+cypherGet :: (ToJSON a1, FromJSON a) => a1 -> SubCypher a
 cypherGet lc = cypher "start a = node:node_auto_index({lc}) return a" $ object ["lc" .= lc]
 
 -- | Get the http connection manager for a Cypher monad
-withCypherManager :: (Manager -> ResourceT IO a) -> Cypher a
+withCypherManager :: (Manager -> IO a) -> Cypher a
 withCypherManager f = Cypher (\(_,m)-> f m)
 
 -- | Execute some number of cypher queries
 runCypher :: Cypher a -> DBInfo -> Manager -> IO a
-runCypher c dbi m =
-	runResourceT $ do
-    	uncypher c (dbi, m)
+runCypher = curry . uncypher
+
+-- | Sequence a [Cypher] as if it was [IO].
+cypherIO :: ([IO a] -> IO b) -> [Cypher a] -> Cypher b
+cypherIO f cs = Cypher $ \d->
+	f $ map (($ d) . uncypher) cs
+
+-- | Execute a subrequest in a separate thread
+forkSubCypher :: SubCypher () -> SubCypher ()
+forkSubCypher (SubCypher cmd) = SubCypher (\d-> resourceForkIO (cmd d) >> return ())
 
 -- | Execute a request in a separate thread
 forkCypher :: Cypher () -> Cypher ()
-forkCypher (Cypher cmd) = Cypher (\d-> resourceForkIO (cmd d) >> return ())
+forkCypher (Cypher cmd) = Cypher (\d-> forkIO (cmd d) >> return ())
