@@ -62,6 +62,8 @@ Library
                        , http-types <1
                        , attoparsec <1
                        , resourcet == 0.3.*
+                       , classy-parallel
+                       , transformers-base
   
   -- Modules not exported by this package.
   -- Other-modules:       

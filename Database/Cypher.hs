@@ -1,4 +1,4 @@
-{-# LANGUAGE OverloadedStrings, TemplateHaskell, DeriveDataTypeable, ScopedTypeVariables, FlexibleInstances #-}
+{-# LANGUAGE OverloadedStrings, TemplateHaskell, DeriveDataTypeable, ScopedTypeVariables, FlexibleInstances, MultiParamTypeClasses #-}
 module Database.Cypher (
 	Cypher,
 	Entity(..),
@@ -34,7 +34,8 @@ import Network.HTTP.Types
 import Data.Conduit
 import Data.Typeable
 import Data.Text (Text)
-import Control.Exception
+import Control.Exception hiding (try, throwIO)
+import Control.Concurrent.MVar
 import Control.Applicative
 import Control.Monad
 import Data.Monoid
@@ -47,6 +48,8 @@ import Data.Text.Lazy.Builder
 import Data.Aeson.Encode
 import Data.List (elemIndices)
 import Control.Monad.Trans.Resource
+import Control.Monad.Base
+import Control.Monad.Parallel (Parallel(..), Fork(..), parallelIO)
 
 -- | Information about your neo4j configuration needed to make requests over the REST api.
 data DBInfo = DBInfo {
@@ -253,3 +256,26 @@ runCypher c dbi m =
 -- | Execute a request in a separate thread
 forkCypher :: Cypher () -> Cypher ()
 forkCypher (Cypher cmd) = Cypher (\d-> resourceForkIO (cmd d) >> return ())
+
+instance Fork Cypher where
+	forkExec (Cypher c) = Cypher $ \d-> do
+		c' <- forkExec (c d)
+		return $ Cypher (const c')
+
+instance Parallel Cypher where
+   bindM2 = parallelIO
+
+instance MonadBase (ResourceT IO) Cypher where
+	liftBase = Cypher . const
+
+instance Functor Cypher where
+	fmap g (Cypher f) = Cypher $ \d-> do
+		arg <- f d
+		return $ g arg
+
+instance Applicative Cypher where
+	pure = Cypher . const . return
+	Cypher f <*> Cypher x = Cypher $ \d-> do
+		func <- f d
+		arg <- x d
+		return $ func arg
