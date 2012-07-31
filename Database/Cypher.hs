@@ -1,7 +1,9 @@
 {-# LANGUAGE OverloadedStrings, TemplateHaskell, DeriveDataTypeable, ScopedTypeVariables, FlexibleInstances, MultiParamTypeClasses #-}
 module Database.Cypher (
 	Cypher,
-	Entity(..),
+	entity_data,
+	entity_id,
+	Entity,
 	CypherResult(..),
 	LuceneQuery,
 	runCypher,
@@ -97,10 +99,16 @@ data CypherRequest = CypherRequest {
 
 -- | A neo4j node or edge
 data Entity a = Entity {
-	entity_id :: String,
+	entity_id :: String, -- ^ The Neo4j node or relationship id
 	entity_properties :: String,
-	entity_data :: a
-} deriving (Show, Eq)
+	entity_data :: a -- ^ The Haskell datatype stored in the Neo4j node or relationship
+} deriving (Show)
+
+instance Eq (Entity a) where
+	a == b = entity_id a == entity_id b
+
+instance Ord (Entity a) where
+	compare a b = compare (entity_id a) (entity_id b)
 
 instance FromJSON a => FromJSON (Entity a) where
 	parseJSON (Object v) = Entity <$>
